@@ -88,6 +88,8 @@
 // =============================================================================
 
 #include <ArduinoJson.h>
+#include <time.h>
+#include <sys/time.h>
 
 
 // =============================================================================
@@ -351,6 +353,12 @@ bool g_wsConnected =
 
 uint32_t g_lastCapture =
     0;
+
+uint32_t g_lastImageSendTime =
+    0;
+
+String g_lastImageSendTimestampStr =
+    "N/A";
 
 
 // =============================================================================
@@ -862,6 +870,8 @@ void stopActiveSession() {
     // =========================================================================
 
     g_lastCapture = 0;
+    g_lastImageSendTime = 0;
+    g_lastImageSendTimestampStr = "N/A";
 
 
     // =========================================================================
@@ -2000,6 +2010,36 @@ void saveDispositivoId(
 
 
 // =============================================================================
+// Time Stamp Helper
+// =============================================================================
+
+String getTimestampStr() {
+    time_t now;
+    time(&now);
+    struct tm timeinfo;
+    if (now > 1600000000 && localtime_r(&now, &timeinfo)) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        int ms = tv.tv_usec / 1000;
+        char buf[32];
+        strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+        char out[64];
+        snprintf(out, sizeof(out), "%s.%03d (ms: %lu)", buf, ms, (unsigned long)millis());
+        return String(out);
+    } else {
+        unsigned long ms = millis();
+        unsigned long sec = ms / 1000;
+        unsigned long min = sec / 60;
+        unsigned long hr = min / 60;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu.%03lu (ms: %lu)",
+                 hr, min % 60, sec % 60, ms % 1000, ms);
+        return String(buf);
+    }
+}
+
+
+// =============================================================================
 // WiFi status string
 // =============================================================================
 
@@ -2308,6 +2348,8 @@ bool connectWiFi() {
         Serial.println(
             "[WiFi] CONEXIÓN EXITOSA"
         );
+
+        configTime(0, 0, "pool.ntp.org", "time.google.com");
 
 
         Serial.printf(
@@ -3407,7 +3449,9 @@ void enqueueAlerts(
 // =============================================================================
 
 void handleDetections(
-    const String& json
+    const String& json,
+    const String& sendTimestamp,
+    const String& recvTimestamp
 ) {
 
     // =========================================================================
@@ -3421,9 +3465,13 @@ void handleDetections(
         return;
     }
 
+    // Limpiar JSON para que no contenga saltos de línea al imprimirse
+    String cleanJson = json;
+    cleanJson.replace("\r", "");
+    cleanJson.replace("\n", " ");
+    cleanJson.trim();
 
     StaticJsonDocument<2048> doc;
-
 
     DeserializationError err =
         deserializeJson(
@@ -3431,16 +3479,17 @@ void handleDetections(
             json
         );
 
-
     if (
         err
     ) {
 
         Serial.printf(
-            "[WS] JSON inválido: %s\n",
+            "Timestamp_Envio: %s | Timestamp_Recibido: %s | Mensaje_Recibido: %s | Prioridad: N/A (JSON inválido: %s)\n",
+            sendTimestamp.c_str(),
+            recvTimestamp.c_str(),
+            cleanJson.c_str(),
             err.c_str()
         );
-
 
         return;
     }
@@ -3468,12 +3517,13 @@ void handleDetections(
             |
             "Error desconocido";
 
-
         Serial.printf(
-            "[WS] Backend: %s\n",
+            "Timestamp_Envio: %s | Timestamp_Recibido: %s | Mensaje_Recibido: %s | Prioridad: N/A (Backend: %s)\n",
+            sendTimestamp.c_str(),
+            recvTimestamp.c_str(),
+            cleanJson.c_str(),
             errorMsg.c_str()
         );
-
 
         return;
     }
@@ -3486,21 +3536,9 @@ void handleDetections(
     JsonArray arr =
         doc.as<JsonArray>();
 
-
     if (
         !arr
     ) {
-
-        // =====================================================================
-        // Formato:
-        //
-        // {
-        //   "ok": true,
-        //   "resultado": {
-        //      "detections": [...]
-        //   }
-        // }
-        // =====================================================================
 
         if (
 
@@ -3553,6 +3591,13 @@ void handleDetections(
 
     ) {
 
+        Serial.printf(
+            "Timestamp_Envio: %s | Timestamp_Recibido: %s | Mensaje_Recibido: %s | Prioridad: 0 (Sin detecciones)\n",
+            sendTimestamp.c_str(),
+            recvTimestamp.c_str(),
+            cleanJson.c_str()
+        );
+
         return;
     }
 
@@ -3564,11 +3609,9 @@ void handleDetections(
     int bestPriority =
         -1;
 
-
     String bestLabel;
 
     String bestPos;
-
 
     for (
         JsonObject det :
@@ -3580,16 +3623,10 @@ void handleDetections(
             |
             "";
 
-
         String pos =
             det["relative_position"]
             |
             "None";
-
-
-        // =====================================================================
-        // Sin posición
-        // =====================================================================
 
         if (
             pos.equalsIgnoreCase(
@@ -3600,17 +3637,11 @@ void handleDetections(
             continue;
         }
 
-
-        // =====================================================================
-        // Prioridad
-        // =====================================================================
-
         int prio =
             getPriority(
                 label,
                 pos
             );
-
 
         if (
             prio >
@@ -3620,14 +3651,41 @@ void handleDetections(
             bestPriority =
                 prio;
 
-
             bestLabel =
                 label;
-
 
             bestPos =
                 pos;
         }
+    }
+
+
+    // =========================================================================
+    // Imprimir registro en una sola línea
+    // =========================================================================
+
+    if (
+        bestPriority >= 0
+    ) {
+
+        Serial.printf(
+            "Timestamp_Envio: %s | Timestamp_Recibido: %s | Mensaje_Recibido: %s | Prioridad: %d (%s, %s)\n",
+            sendTimestamp.c_str(),
+            recvTimestamp.c_str(),
+            cleanJson.c_str(),
+            bestPriority,
+            bestLabel.c_str(),
+            bestPos.c_str()
+        );
+
+    } else {
+
+        Serial.printf(
+            "Timestamp_Envio: %s | Timestamp_Recibido: %s | Mensaje_Recibido: %s | Prioridad: 0 (Sin posición válida)\n",
+            sendTimestamp.c_str(),
+            recvTimestamp.c_str(),
+            cleanJson.c_str()
+        );
     }
 
 
@@ -3638,17 +3696,6 @@ void handleDetections(
     if (
         bestLabel.length() > 0
     ) {
-
-        Serial.printf(
-            "[DETECT] %s | %s | prioridad=%d\n",
-
-            bestLabel.c_str(),
-
-            bestPos.c_str(),
-
-            bestPriority
-        );
-
 
         enqueueAlerts(
 
@@ -3808,24 +3855,18 @@ void webSocketEvent(
                 break;
             }
 
+            String recvTimestampStr = getTimestampStr();
 
             String jsonContent =
                 String(
                     (char*)payload
                 );
 
-
-            Serial.printf(
-                "[WS] Datos recibidos: %u bytes\n",
-                (unsigned)
-                length
-            );
-
-
             handleDetections(
-                jsonContent
+                jsonContent,
+                g_lastImageSendTimestampStr,
+                recvTimestampStr
             );
-
 
             break;
         }
@@ -3836,6 +3877,16 @@ void webSocketEvent(
         // =====================================================================
 
         case WStype_BIN: {
+
+            uint32_t recvTime = millis();
+            uint32_t rtt = (g_lastImageSendTime > 0) ? (recvTime - g_lastImageSendTime) : 0;
+
+            Serial.printf(
+                "[WS] [TIMESTAMP RECEPCIÓN BIN: %s] Datos binarios recibidos: %u bytes (RTT: %u ms)\n",
+                getTimestampStr().c_str(),
+                (unsigned)length,
+                (unsigned)rtt
+            );
 
             break;
         }
@@ -4955,6 +5006,14 @@ void loop() {
                     g_accessToken.length() > 0
 
                 ) {
+
+                    g_lastImageSendTime = millis();
+                    g_lastImageSendTimestampStr = getTimestampStr();
+                    Serial.printf(
+                        "[WS] [TIMESTAMP ENVÍO: %s] Enviando frame al Backend (%u bytes)...\n",
+                        g_lastImageSendTimestampStr.c_str(),
+                        (unsigned)fb->len
+                    );
 
                     bool sent =
                         g_ws.sendBIN(
